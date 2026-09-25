@@ -1,0 +1,12 @@
+# Node.js project. Install these packages with: npm install
+# Python is not required.
+
+Node.js >= 18
+
+express
+playwright
+dotenv
+@aws-sdk/client-s3
+
+# Browser installation:
+# PLAYWRIGHT_BROWSERS_PATH=0 npx playwright install chromium
