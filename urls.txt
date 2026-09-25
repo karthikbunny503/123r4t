@@ -1,3 +1,1 @@
-# One authorized webpage URL per line.
-# Example:
 https://wispbyte.com/
