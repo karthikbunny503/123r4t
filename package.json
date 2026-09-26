@@ -1,8 +1,8 @@
 {
   "name": "pella-render-recorder",
-  "version": "11.0.0",
+  "version": "13.0.0",
   "private": true,
-  "description": "Render-hosted Playwright webpage recorder with Backblaze B2 upload and browser download links with server-rendered dashboard.",
+  "description": "Render-hosted Playwright webpage recorder with Backblaze B2 upload, multi-URL scheduling, quality presets, live preview, B2 video preview, download, and delete controls.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
