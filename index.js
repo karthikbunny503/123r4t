@@ -35,7 +35,7 @@ const QUALITY_PRESETS = {
 
 const DEFAULT_QUALITY = String(process.env.DEFAULT_QUALITY || '480p');
 const B2_PREFIX = 'recordings/';
-const APP_VERSION = '13.0.0';
+const APP_VERSION = '15.0.0';
 
 fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 
@@ -63,6 +63,7 @@ let lastResult = null;
 let lastError = null;
 let livePreviewBuffer = null;
 let livePreviewUpdatedAt = null;
+let activeRunUrls = null;
 
 let b2EndpointError = null;
 try {
@@ -286,7 +287,7 @@ async function recordUrl(url, index, runSettings) {
   };
 }
 
-async function runRecorder() {
+async function runRecorder(urlsOverride = null) {
   if (running) return;
   running = true;
   stopRequested = false;
@@ -294,8 +295,10 @@ async function runRecorder() {
 
   const runSettings = { ...settings };
   try {
-    const urls = readUrls();
-    if (!urls.length) throw new Error(`No URLs found in ${URLS_FILE}`);
+    const urls = Array.isArray(urlsOverride) ? normalizeUrls(urlsOverride) : readUrls();
+    if (!urls.length) throw new Error(`No URLs provided. Paste one or more links in the panel or add them to ${URLS_FILE}.`);
+    activeRunUrls = urls.slice();
+    writeUrls(urls);
     console.log(`Recorder starting. ${urls.length} URL(s). Quality: ${runSettings.quality} (${runSettings.width}x${runSettings.height}), ${runSettings.recordSeconds}s each.`);
 
     for (let i = 0; i < urls.length && !stopRequested; i++) {
@@ -313,6 +316,7 @@ async function runRecorder() {
     stopRequested = false;
     livePreviewBuffer = null;
     livePreviewUpdatedAt = null;
+    activeRunUrls = null;
     console.log('Recorder finished.');
   }
 }
@@ -399,11 +403,15 @@ app.get('/health', (_req, res) => {
 });
 
 app.get('/api/status', (_req, res) => {
+  let savedUrls = [];
+  try { savedUrls = readUrls(); } catch (err) { lastError = `URL file error: ${err.message}`; }
   res.json({
     running,
     currentUrl,
     currentIndex,
-    urls: readUrls(),
+    urls: activeRunUrls || savedUrls,
+    savedUrls,
+    runSource: activeRunUrls ? 'panel' : 'urls.txt',
     settings,
     qualityPresets: QUALITY_PRESETS,
     b2Configured,
@@ -417,10 +425,26 @@ app.get('/api/status', (_req, res) => {
   });
 });
 
-app.post('/api/start', (_req, res) => {
+app.post('/api/start', (req, res) => {
   if (running) return res.status(409).json({ ok: false, error: 'Recorder is already running.' });
-  runRecorder().catch(err => console.error(`Recorder fatal error: ${err.message}`));
-  res.json({ ok: true, started: true, settings });
+  try {
+    // IMPORTANT: a manual Start Recording request must use ONLY the URLs supplied by the panel.
+    // urls.txt is only the fallback when the recorder is started by AUTO_START or another non-panel caller.
+    const input = Array.isArray(req.body?.urls) ? req.body.urls : req.body?.text;
+    const urls = normalizeUrls(input);
+    if (!urls.length) return res.status(400).json({ ok: false, error: 'Paste at least one URL in the panel before starting.' });
+
+    writeUrls(urls);
+    activeRunUrls = urls.slice();
+    console.log(`Panel start requested with ${urls.length} URL(s):`);
+    urls.forEach((u, i) => console.log(`  [${i + 1}] ${u}`));
+
+    // Pass the validated panel snapshot directly into the recorder.
+    runRecorder(urls).catch(err => console.error(`Recorder fatal error: ${err.message}`));
+    res.json({ ok: true, started: true, urls, source: 'panel', settings });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
 });
 
 app.post('/api/stop', (_req, res) => {
@@ -440,6 +464,14 @@ app.post('/api/settings', (req, res) => {
     const preset = QUALITY_PRESETS[quality];
     saveSettings({ quality, width: preset.width, height: preset.height, recordSeconds: Math.round(recordSeconds) });
     res.json({ ok: true, settings });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/urls', (_req, res) => {
+  try {
+    res.json({ ok: true, urls: readUrls() });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -628,7 +660,7 @@ label { font-size: 13px; font-weight: 600; }
       <div>
         <h1>Pella Render Recorder</h1>
         <div id="status" class="status">Running: ${running ? 'YES' : 'NO'}${currentUrl ? ` · Current: ${esc(currentUrl)}` : ''} · B2: ${b2Configured ? 'configured' : 'not configured'} · Bucket: ${esc(B2_BUCKET || 'not set')} · Version: ${APP_VERSION}</div>
-        <div class="small" style="margin-top:6px">Selected quality: <span id="statusQuality" class="badge">${esc(settings.quality)}</span> ${settings.width}×${settings.height} · ${settings.recordSeconds}s per URL</div>
+        <div class="small" style="margin-top:6px">Selected quality: <span id="statusQuality" class="badge">${esc(settings.quality)}</span> ${settings.width}×${settings.height} · ${settings.recordSeconds}s per URL · Panel URLs are used on manual start</div>
       </div>
       <div class="actions">
         <button class="primary" onclick="startRecorder()">Start Recording</button>
@@ -660,12 +692,13 @@ label { font-size: 13px; font-weight: 600; }
     <div class="field">
       <label for="urls">Multiple links — one URL per line</label>
       <textarea id="urls">${esc(urls.join('\n'))}</textarea>
-      <div class="help">The recorder processes every link in order. HTTPS and HTTP URLs are supported.</div>
+      <div class="help">Paste one or more links here. <b>Start Recording always uses these panel links.</b> urls.txt is only the saved copy / fallback.</div>
     </div>
     <div class="inline" style="margin-top:10px">
       <input id="newUrl" type="text" placeholder="https://example.com/video-page">
       <button onclick="addUrl()">Add URL</button>
       <button onclick="saveUrls()">Save URL List</button>
+      <button onclick="loadSavedUrls()">Load urls.txt</button>
     </div>
   </section>
 
@@ -721,7 +754,7 @@ async function refreshStatus() {
   try {
     const s = await api('/api/status');
     const el = document.getElementById('status');
-    el.textContent = 'Running: ' + (s.running ? 'YES' : 'NO') + (s.currentUrl ? ' · Current: ' + s.currentUrl : '') + ' · B2: ' + (s.b2Configured ? 'configured' : 'not configured') + (s.bucket ? ' · Bucket: ' + s.bucket : '') + ' · Version: ${APP_VERSION}';
+    el.textContent = 'Running: ' + (s.running ? 'YES' : 'NO') + (s.currentUrl ? ' · Current: ' + s.currentUrl : '') + ' · Source: ' + (s.runSource || 'panel') + ' · B2: ' + (s.b2Configured ? 'configured' : 'not configured') + (s.bucket ? ' · Bucket: ' + s.bucket : '') + ' · Version: ' + '${APP_VERSION}';
     el.className = 'status ' + (s.lastError ? 'error' : 'ok');
     document.getElementById('statusQuality').textContent = s.settings.quality;
     updateLivePreview(s);
@@ -752,18 +785,40 @@ async function refreshFiles() {
     document.getElementById('files').innerHTML = '<div class="error-box">B2 file list error: ' + escapeHtml(e.message) + '</div>';
   }
 }
-async function refreshUrls() {
+async function loadSavedUrls() {
   try {
-    const s = await api('/api/status');
-    document.getElementById('urls').value = s.urls.join('\n');
-  } catch (_) {}
+    const data = await api('/api/urls');
+    document.getElementById('urls').value = data.urls.join('\n');
+  } catch (e) { alert('Could not load urls.txt: ' + e.message); }
 }
-async function refreshAll() {
-  await Promise.all([refreshStatus(), refreshFiles(), refreshUrls()]);
+async function refreshAll(initial = false) {
+  await Promise.all([refreshStatus(), refreshFiles()]);
+  // Never overwrite unsaved text in the panel during a recording. Only load saved URLs on first page load.
+  if (initial) await loadSavedUrls();
 }
 async function startRecorder() {
-  try { await saveSettings(true); await saveUrls(true); await api('/api/start', {method:'POST'}); await refreshAll(); }
-  catch (e) { alert(e.message); }
+  const startBtn = document.querySelector('button.primary');
+  try {
+    const raw = document.getElementById('urls').value;
+    const panelUrls = raw.split(/\r?\n/).map(v => v.trim()).filter(Boolean);
+    if (!panelUrls.length) throw new Error('Paste at least one URL in the panel before starting.');
+
+    await saveSettings(true);
+    startBtn.disabled = true;
+    startBtn.textContent = 'Starting…';
+    const data = await api('/api/start', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ urls: panelUrls })
+    });
+    document.getElementById('urls').value = data.urls.join('\n');
+    await refreshAll(false);
+  } catch (e) {
+    alert(e.message);
+  } finally {
+    startBtn.disabled = false;
+    startBtn.textContent = 'Start Recording';
+  }
 }
 async function stopRecorder() {
   try { await api('/api/stop', {method:'POST'}); await refreshStatus(); }
@@ -790,6 +845,13 @@ function addUrl() {
   const input = document.getElementById('newUrl');
   const value = input.value.trim();
   if (!value) return;
+  try {
+    const u = new URL(value);
+    if (!/^https?:$/.test(u.protocol)) throw new Error('Only http:// and https:// are allowed.');
+  } catch (e) {
+    alert('Invalid URL: ' + e.message);
+    return;
+  }
   const box = document.getElementById('urls');
   box.value = box.value.trim() ? box.value.trim() + '\n' + value : value;
   input.value = '';
@@ -817,7 +879,7 @@ async function deleteSelected() {
 }
 setInterval(() => { refreshStatus(); }, 2000);
 setInterval(() => { refreshFiles(); }, 7000);
-refreshAll();
+refreshAll(true);
 </script>
 </body>
 </html>`);
